@@ -1,0 +1,12 @@
+# 阿里云 SDK - 用于操作 DNS 解析记录
+aliyun-python-sdk-core>=2.13.36
+aliyun-python-sdk-alidns>=2.6.36
+
+# 七牛云 SDK - 用于上传和管理 SSL 证书
+qiniu>=7.12.0
+
+# HTTP 请求库 - 用于调用七牛云 API
+requests>=2.28.0
+
+# 其他依赖
+python-dateutil>=2.8.2
