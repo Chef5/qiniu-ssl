@@ -15,7 +15,7 @@ import json
 import subprocess
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import time
 
 try:
@@ -132,6 +132,37 @@ class SSLCertificateManager:
             return '.'.join(parts[-2:])
         return domain
 
+    def _acme_ecc_args(self, domain: str):
+        """若证书目录为 ECC（acme.sh 的 {domain}_ecc），续签/第二步必须带 --ecc，否则会更新 RSA 槽位而磁盘上仍是旧 ECC 全链。"""
+        acme_home = os.path.expanduser(self.config.get('acme_home', '~/.acme.sh'))
+        if os.path.exists(os.path.join(acme_home, f'{domain}_ecc')):
+            return ['--ecc']
+        return []
+
+    def _acme_server_and_account_args(self, acme_server: Optional[str], email: str) -> List[str]:
+        """为每次 acme.sh 调用固定 CA 与账号邮箱。证书目录里可能记着 ZeroSSL 等 Le_API，不显式传 --server 时会沿用旧 CA，与 config 不一致。"""
+        args: List[str] = []
+        if email:
+            args.extend(["--accountemail", email])
+        s = (acme_server or "letsencrypt").strip()
+        low = s.lower()
+        if low in ("letsencrypt", "le"):
+            args.extend(["--server", "letsencrypt"])
+        elif low in ("letsencrypt_test", "letsencrypt-test", "staging", "le_test", "le-test"):
+            args.extend(["--server", "letsencrypt_test"])
+        else:
+            args.extend(["--server", s])
+        return args
+
+    def _log_acme_run_failure(self, label: str, proc: subprocess.CompletedProcess):
+        logger.error(
+            "%s 失败 (exit=%s)\nstdout:\n%s\nstderr:\n%s",
+            label,
+            proc.returncode,
+            proc.stdout or "",
+            proc.stderr or "",
+        )
+
     def add_dns_txt_record(self, domain: str, record_value: str) -> Optional[str]:
         """添加 DNS TXT 记录用于 ACME 验证"""
         root_domain = self.get_root_domain(domain)
@@ -155,6 +186,8 @@ class SSLCertificateManager:
                 request.set_Type('TXT')
                 request.set_Value(record_value)
                 self.ali_client.do_action_with_exception(request)
+                logger.info("等待 DNS 记录生效 (60秒)...")
+                time.sleep(60)
                 return existing_record_id
             else:
                 # 添加新记录
@@ -239,11 +272,14 @@ class SSLCertificateManager:
         cert_exists = self.check_certificate_exists(domain)
 
         if cert_exists and force_renew:
-            # 证书已存在且需要强制续期，使用 --renew --force
-            logger.info(f"证书已存在，使用强制续期模式")
+            # 手动 DNS 下勿用「第一步 --renew --force」：有未完成的订单时 acme.sh 会直接
+            # Verifying，不打印 TXT，脚本来不及写 DNS 即 NXDOMAIN。与首次签发一致用
+            # --issue --dns --force，重新进入「先 TXT、再第二步 --renew」流程。
+            logger.info("证书已存在，使用强制续期模式（手动 DNS：--issue --dns --force 获取 TXT）")
             cmd = [
                 f"{acme_home}/acme.sh",
-                "--renew",
+                "--issue",
+                "--dns",
                 "--force",
                 "-d", domain,
                 "--yes-I-know-dns-manual-mode-enough-go-ahead-please"
@@ -258,15 +294,12 @@ class SSLCertificateManager:
                 "--yes-I-know-dns-manual-mode-enough-go-ahead-please"
             ]
 
-        if email:
-            cmd.extend(["--accountemail", email])
+        cmd.extend(self._acme_server_and_account_args(acme_server, email))
+        logger.info(
+            "acme.sh 已固定 CA（与 config 的 acme_server 一致，避免沿用证书目录里的 Le_API）"
+        )
 
-        # 添加 ACME 服务器配置
-        if acme_server and acme_server.lower() != 'letsencrypt':
-            cmd.extend(["--server", acme_server])
-            logger.info(f"使用 ACME 服务器: {acme_server}")
-        else:
-            logger.info(f"使用默认 ACME 服务器: Let's Encrypt")
+        cmd.extend(self._acme_ecc_args(domain))
 
         try:
             # 第一次运行获取需要设置的 TXT 记录值
@@ -283,8 +316,7 @@ class SSLCertificateManager:
 
             if not txt_value:
                 logger.error("无法从 acme.sh 输出中提取 TXT 记录值")
-                logger.error(f"acme.sh 输出: {result.stdout}")
-                logger.error(f"acme.sh 错误: {result.stderr}")
+                self._log_acme_run_failure("acme.sh（获取 TXT）", result)
                 return False
 
             logger.info(f"提取到 TXT 记录值: {txt_value}")
@@ -301,9 +333,17 @@ class SSLCertificateManager:
             cmd_renew = [
                 f"{acme_home}/acme.sh",
                 "--renew",
+            ]
+            # 强制续期场景下第二步也必须带 --force，否则 acme.sh 会因「未到续期日」直接
+            # Skipping 退出，不会继续完成已挂起的手动 DNS 订单（exit=2）。
+            if force_renew:
+                cmd_renew.append("--force")
+            cmd_renew.extend([
                 "-d", domain,
                 "--yes-I-know-dns-manual-mode-enough-go-ahead-please"
-            ]
+            ])
+            cmd_renew.extend(self._acme_server_and_account_args(acme_server, email))
+            cmd_renew.extend(self._acme_ecc_args(domain))
 
             result_renew = subprocess.run(
                 cmd_renew,
@@ -319,7 +359,7 @@ class SSLCertificateManager:
                 logger.info("证书申请成功！")
                 return True
             else:
-                logger.error(f"证书申请失败: {result_renew.stderr}")
+                self._log_acme_run_failure("acme.sh（完成签发）", result_renew)
                 return False
 
         except Exception as e:
